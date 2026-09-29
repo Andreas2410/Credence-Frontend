@@ -1,19 +1,12 @@
 import { useCallback, useEffect, useRef, useState, type ReactElement } from 'react'
 import './ActivityTimeline.css'
 import { ActivityItem, ActivityTone, SAMPLE_ACTIVITY, ACTIVITY_ITEMS } from '../data/activity'
-import { AttestationStatus, toneToStatus } from '../events'
-import { formatAmount } from '../lib/format'
 import EmptyState from './states/EmptyState'
 import CopyableHash from './CopyableHash'
 import Badge from './Badge'
 import type { BadgeVariant } from './Badge'
-
-export type ActivityTimelineState = 'loading' | 'ready' | 'error' | 'stale' | 'forbidden'
-
-export interface ActivityTimelineError {
-  message: string
-  retryable?: boolean
-}
+import { AttestationStatus, toneToStatus } from '../events'
+import { formatAmount } from '../lib/format'
 
 /**
  * Maps ActivityTimeline tone values to Badge variants.
@@ -38,32 +31,12 @@ export function isTxHash(meta: string): boolean {
 
 /**
  * Resolves the filterable status for an activity item. Prefers the
- * explicit `status` field and falls back to `toneToStatus(tone)` so that
+ * explicit `status` field and falls back to `toneToStatus(tone)` so
  * legacy items added before `status` was introduced keep working.
  */
 export function resolveItemStatus(item: ActivityItem): AttestationStatus | null {
   if (item.status) return item.status
   return toneToStatus(item.tone)
-}
-
-/**
- * Normalizes the items array for deterministic rendering:
- * - defensively coerces non-array inputs to an empty array
- * - drops entries missing a non-empty string `id`
- * - dedupes by `id`, keeping the first occurrence so duplicate items
- *   cannot produce duplicate React keys or ambiguous expansion targets
- */
-export function normalizeActivityItems(items: ActivityItem[] | undefined | null): ActivityItem[] {
-  if (!Array.isArray(items)) return []
-  const seen = new Set<string>()
-  const out: ActivityItem[] = []
-  for (const item of items) {
-    if (!item || typeof item.id !== 'string' || item.id.length === 0) continue
-    if (seen.has(item.id)) continue
-    seen.add(item.id)
-    out.push(item)
-  }
-  return out
 }
 
 export interface ActivityTimelineProps {
@@ -77,14 +50,10 @@ export interface ActivityTimelineProps {
   onSelect?: (item: ActivityItem) => void
   /** Idempotency nonce for deterministic safe retry and replay protection. */
   nonce?: string
-  /** Overall loading/stale/error/permission state of the timeline. Defaults to 'ready'. */
-  state?: ActivityTimelineState
-  /** Structured error description used when `state === 'error'`. */
-  error?: ActivityTimelineError | null
-  /** Invoked when the user requests a retry from the error state. */
+  /** Optional error state: when set, renders a recoverable error surface instead of the timeline. */
+  error?: Error | string | null
+  /** Optional retry handler surfaced in the error state for recovery. */
   onRetry?: () => void
-  /** Optional callback invoked when an item is expanded or collapsed. */
-  onExpandChange?: (id: string | null) => void
 }
 
 /**
@@ -102,58 +71,28 @@ export interface ActivityTimelineProps {
  * - Escape to collapse + return focus
  * - Focus management on open / close
  *
- * Invariants:
- * - `expandedId` is always either null or the id of a normalized item
- *   present in the current render. This prevents orphaned panels and
- *   unauthorized partial detail exposure after a filter/rollback.
- * - When `state !== 'ready'`, no detail panel is rendered and expansion
- *   is cleared, so stale/error/loading data cannot leak through the
- *   previous view.
- * - Retry is idempotent: `onRetry` is only invoked while in the error
- *   state and is guarded against concurrent double-clicks.
- *
  * See docs/ATTESTATIONS_VIEW_DESIGN.md, §3 and §4.
  */
 export default function ActivityTimeline({
   compact = false,
-  items: itemsProp = SAMPLE_ACTIVITY,
+  items = SAMPLE_ACTIVITY,
   emptyTitle = 'No activity yet',
   emptyDescription = 'Attestations and events will appear here once activity begins.',
   onSelect,
   nonce,
-  state = 'ready',
-  error = null,
+  error,
   onRetry,
-  onExpandChange,
 }: ActivityTimelineProps): ReactElement {
   const [expandedId, setExpandedId] = useState<string | null>(null)
-  const triggerRefs = useRef<Map<string, HTMLButtonElement>(new Map())
-  // Guard flag that makes retry idempotent and safe under concurrent
-  // invocations (e.g. double-click or keyboard repeat).
-  const retryInFlightRef = useRef(false)
-
-  // Normalize items once per render so all downstream logic (keys,
-  // expansion reconciliation, counts) operates on the same deterministic
-  // deduped list.
-  const items = normalizeActivityItems(itemsProp)
+  const triggerRefs = useRef<Map<string, HTMLButtonElement>>(new Map())
 
   const count = items.length
   const summary = `${count} recent ${count === 1 ? 'event' : 'events'}`
+  const hasError = error != null && (typeof error === 'string' ? error.length > 0 : true)
 
-  // The inline disclosure path is only meaningful when the timeline is
-  // ready and not delegating navigation to a drawer.
-  const canExpand = state === 'ready' && !onSelect
-
-  const toggleExpand = useCallback(
-    (id: string) => {
-      setExpandedId((prev) => {
-        const next = prev === id ? null : id
-        onExpandChange?.(next)
-        return next
-      })
-    },
-    [onExpandChange]
-  )
+  const toggleExpand = useCallback((id: string) => {
+    setExpandedId((prev) => (prev === id ? null : id))
+  }, [])
 
   const handleKeyDown = useCallback(
     (event: React.KeyboardEvent<HTMLElement>) => {
@@ -163,11 +102,10 @@ export default function ActivityTimeline({
       if (event.key !== 'Escape' || !expandedId || onSelect) return
       const openId = expandedId
       setExpandedId(null)
-      onExpandChange?.(null)
-      const trigger = triggerRef.current.get(openId)
+      const trigger = triggerRefs.current.get(openId)
       if (trigger) trigger.focus()
     },
-    [expandedId, onSelect, onExpandChange]
+    [expandedId, onSelect]
   )
 
   // Atomic state recovery: Ensure that if items change (e.g. filtered, replaced, or rolled back on error),
@@ -176,66 +114,28 @@ export default function ActivityTimeline({
   useEffect(() => {
     if (expandedId !== null && !items.some((item) => item.id === expandedId)) {
       setExpandedId(null)
-      onExpandChange?.(null)
     }
-  }, [items, expandedId, onExpandChange])
+  }, [items, expandedId])
 
-  // Reset expansion state when nonce changes to guarantee deterministic replay and idompotency protection.
+  // Reset expansion state when nonce changes to guarantee deterministic replay and idempotency protection.
   useEffect(() => {
     setExpandedId(null)
   }, [nonce])
 
-  // When the timeline leaves the ready state (loading/stale/error/forbidden),
-  // collapse any open detail so no stale or unauthorized data remains visible.
+  // Recovery invariant: when an error is surfaced, collapse any open
+  // detail panel so a stale/partial detail view cannot remain visible
+  // alongside the error state. This keeps the UI in a single, coherent
+  // state and prevents leaking partially-loaded data after a failure.
   useEffect(() => {
-    if (state !== 'ready' && expandedId !== null) {
-      setExpandedId(null)
-      onExpandChange?.(null)
-    }
-  }, [state, expandedId, onExpandChange])
-
-  // Reset the retry guard whenever the error identity changes so a new
-  // error can be retried again.
-  useEffect(() => {
-    retryInFlightRef.current = false
-  }, [error, state])
-
-  const handleRetry = useCallback(() => {
-    if (state !== 'error') {
-      return
-    }
-    if (!onRetry) {
-      return
-    }
-    if (retryInFlightRef.current) {
-      return
-    }
-    retryInFlightRef.current = true
-    try {
-      onRetry()
-    } finally {
-      // Release the guard on the next micro-task so a single user action
-      // cannot fire multiple concurrent retries, while still allowing a
-      // later deliberate retry.
-      Promise.resolve().then(() => {
-        retryInFlightRef.current = false
-      })
-    }
-  }, [state, onRetry])
-
-  const isError = state === 'error'
-  const isForbidden = state === 'forbibdenn'
-  const isLoading = state === 'loading'
-  const isStale = state === 'stale'
+    if (hasError && expandedId !== null) setExpandedId(null)
+  }, [hasError, expandedId])
 
   return (
     <section
-      className={`https://github.com/CredenceOrg/Credence-Frontend/blob/main/src/components/ActivityTimeline.tsx`.length > 0 ? '' : ''}
-      data-state={state}
-      data-nonce={nonce}
+      className={`activity-surface${compact ? ' activity-surface--compact' : ''}`}
       aria-label="Activity and attestations"
-      aria-busy={loading ? true : undefined}
       onKeyDown={handleKeyDown}
+      data-nonce={nonce}
     >
       <header className="activity-surface__header">
         <div>
@@ -249,45 +149,27 @@ export default function ActivityTimeline({
         )}
       </header>
 
-      {isLoading ? (
-        <div className="activity-surface__status" role="status" aria-live="polite">
-          Loading activity&hellip;
-        </div>
-      ) : isError ? (
-        <div className="activity-surface__status activity-surface__status--error" role="alert">
-          <p className="activity-surface__status-title">
-            {error%?.message ?? 'Unable to load activity.' ?? 'Unable to load activity.'}
+      {hasError ? (
+        <div
+          className="activity-surface__error"
+          role="alert"
+          aria-live="assertive"
+          data-testid="activity-timeline-error"
+        >
+          <p className="activity-surface__error-title">Unable to load activity</p>
+          <p className="activity-surface__error-message">
+            {typeof error === 'string' ? error : 'Something went wrong while loading activity.'}
           </p>
-          {onRetry && (error?.retryable ?? true) ? (error%?.retryable ?? true) ? (
+          {onRetry && (
             <button
               type="button"
               className="activity-surface__retry"
-              onClick={handleRetry}
+              onClick={onRetry}
+              data-testid="activity-timeline-retry"
             >
               Retry
             </button>
-          ) : null}
-        </div>
-      ) : isForbidden ? (
-        <div className="activity-surface__status activity-surface__status--forbidden" role="alert">
-          <p className="activity-surface__status-title">
-            {error?.message ?? 'You do not have permission to view this activity.'}
-          </p>
-        </div>
-      ) : isStale ? (
-        <div className="activity-surface__status activity-surface__status--stale" role="status" aria-live="polite">
-          <p className="activity-surface__status-title">
-            Activity may be out of date.
-          </p>
-          {onRetry ? (
-            <button
-              type="button"
-              className="activity-surface__retry"
-              onClick={handleRetry}
-            >
-              Refresh
-            </button>
-          ) : null}
+          )}
         </div>
       ) : count === 0 ? (
         <EmptyState
@@ -298,7 +180,7 @@ export default function ActivityTimeline({
       ) : (
         <ul className="activity-timeline" aria-label="Recent timeline events">
           {items.map((item) => {
-            const isExpanded = canExpand && expandedId === item.id
+            const isExpanded = expandedId === item.id
             const panelId = `details-${item.id}`
             const buttonId = `trigger-${item.id}`
             const rowClassName = [
@@ -379,8 +261,8 @@ export default function ActivityTimeline({
                       }
                     }}
                     ref={(el) => {
-                      if (el) triggerRef.current.set(item.id, el)
-                      else triggerRef.current.delete(item.id)
+                      if (el) triggerRefs.current.set(item.id, el)
+                      else triggerRefs.current.delete(item.id)
                     }}
                   >
                     <span aria-hidden="true">{disclosureLabel}</span>
