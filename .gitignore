@@ -2,8 +2,6 @@ node_modules
 dist
 *.local
 .DS_Store
-.env
-.env.*
 !.env.example
 coverage
 
@@ -17,3 +15,7 @@ blob-report
 
 # Lighthouse CI reports
 lhci-reports
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+config.bat
