@@ -47,20 +47,23 @@ export function resolveItemStatus(item: ActivityItem): AttestationStatus | null 
 }
 
 /**
- * Normalizes a potentially untrusted items array into a deterministic
- * list. Duplicate ids are deduped by last-write-wins so a refetch that
- * returns a stale and fresh copy of the same event never renders twice.
- * Entries missing a stable `id` are dropped rather than rendered with
- * an ephemeral key, which would orphan expansion state and break a
- * retry/replay guarantee.
+ * Normalizes the items array for deterministic rendering:
+ * - defensively coerces non-array inputs to an empty array
+ * - drops entries missing a non-empty string `id`
+ * - dedupes by `id`, keeping the first occurrence so duplicate items
+ *   cannot produce duplicate React keys or ambiguous expansion targets
  */
-export function normalizeItems(items: ActivityItem[]): ActivityItem[] {
-  const seen = new Map<string, ActivityItem>()
+export function normalizeActivityItems(items: ActivityItem[] | undefined | null): ActivityItem[] {
+  if (!Array.isArray(items)) return []
+  const seen = new Set<string>()
+  const out: ActivityItem[] = []
   for (const item of items) {
     if (!item || typeof item.id !== 'string' || item.id.length === 0) continue
-    seen.set(item.id, item)
+    if (seen.has(item.id)) continue
+    seen.add(item.id)
+    out.push(item)
   }
-  return Array.from(seen.values())
+  return out
 }
 
 export interface ActivityTimelineProps {
@@ -74,45 +77,14 @@ export interface ActivityTimelineProps {
   onSelect?: (item: ActivityItem) => void
   /** Idempotency nonce for deterministic safe retry and replay protection. */
   nonce?: string
-
-  /** Explicit lifecycle state. When omitted the component derives
-   *  'ready' or 'error' from the provided items/error props for backwards
-   *  compatibility with existing callers. */
+  /** Overall loading/stale/error/permission state of the timeline. Defaults to 'ready'. */
   state?: ActivityTimelineState
-  /** Structured error description. Only the message is rendered;
-   *  never raw server payloads. */
+  /** Structured error description used when `state === 'error'`. */
   error?: ActivityTimelineError | null
-  /** Invoked when the user requests a retry from an error/stale state.
-   *  If omitted the retry affordance is not rendered. */
+  /** Invoked when the user requests a retry from the error state. */
   onRetry?: () => void
-  /** True while a retry is in flight so the button can disable and
-   *  prevent concurrent duplicate requests. */
-  retrying?: boolean
-  /** Optional callback for observability when a failure is surfaced.
-   *  Receives a sanitized event name only. */
-  onStateError?: (event: string, detail?: Record<string, unknown>) => void
-}
-
-const STATE_MESSAGES: Record<Exclude<ActivityTimelineState, 'ready'>, {
-  title: string
-  description: string
-}> = {
-  loading: {
-    title: 'Loading activity',
-    description: 'Fetching the latest attestations and events…',
-  },
-  error: {
-    title: 'Unable to load activity',
-    description: 'Something went wrong while loading the timeline.',
-  },
-  stale: {
-    title: 'Activity may be out of date',
-    description: 'We couldn’t refresh the latest activity. Showing the last known good data.',
-  },
-  forbidden: {
-    title: 'Access restricted',
-    description: 'You do not have permission to view this activity.',
-  },
+  /** Optional callback invoked when an item is expanded or collapsed. */
+  onExpandChange?: (id: string | null) => void
 }
 
 /**
@@ -130,48 +102,58 @@ const STATE_MESSAGES: Record<Exclude<ActivityTimelineState, 'ready'>, {
  * - Escape to collapse + return focus
  * - Focus management on open / close
  *
- * Lifecycle invariants:
- * - The list is never rendered in a non-ready state. Loading, error,
- *   stale, and forbidden states show a state surface instead.
- * - In the stale state the last known good items are still rendered
- *   below a non-blocking banner so user data is never lost.
- * - Expansion state is cleared whenever the underlying item disappears,
- *   when the nonce changes, or when the component leaves the ready state.
+ * Invariants:
+ * - `expandedId` is always either null or the id of a normalized item
+ *   present in the current render. This prevents orphaned panels and
+ *   unauthorized partial detail exposure after a filter/rollback.
+ * - When `state !== 'ready'`, no detail panel is rendered and expansion
+ *   is cleared, so stale/error/loading data cannot leak through the
+ *   previous view.
+ * - Retry is idempotent: `onRetry` is only invoked while in the error
+ *   state and is guarded against concurrent double-clicks.
  *
  * See docs/ATTESTATIONS_VIEW_DESIGN.md, §3 and §4.
  */
 export default function ActivityTimeline({
   compact = false,
-  items = SAMPLE_ACTIVITY,
+  items: itemsProp = SAMPLE_ACTIVITY,
   emptyTitle = 'No activity yet',
   emptyDescription = 'Attestations and events will appear here once activity begins.',
   onSelect,
   nonce,
-  state,
-  error,
+  state = 'ready',
+  error = null,
   onRetry,
-  retrying = false,
-  onStateError,
+  onExpandChange,
 }: ActivityTimelineProps): ReactElement {
   const [expandedId, setExpandedId] = useState<string | null>(null)
-  const triggerRefs = useRef<Map<string, HTMLButtonElement>>(new Map())
+  const triggerRefs = useRef<Map<string, HTMLButtonElement>(new Map())
+  // Guard flag that makes retry idempotent and safe under concurrent
+  // invocations (e.g. double-click or keyboard repeat).
+  const retryInFlightRef = useRef(false)
 
-  // Derive the effective lifecycle state. An explicit `state` prop wins;
-  // otherwise fall back to error/ready derived from the existing props
-  // so legacy callers that only pass `items` keep working unchanged.
-  const effectiveState: ActivityTimelineState =
-    state ?? (error ? 'error' : 'ready')
+  // Normalize items once per render so all downstream logic (keys,
+  // expansion reconciliation, counts) operates on the same deterministic
+  // deduped list.
+  const items = normalizeActivityItems(itemsProp)
 
-  // Normalize items once per render so duplicate ids and malformed
-  // entries cannot produce an inconsistent or ambiguous tree.
-  const normalizedItems = normalizeItems(items)
-
-  const count = normalizedItems.length
+  const count = items.length
   const summary = `${count} recent ${count === 1 ? 'event' : 'events'}`
 
-  const toggleExpand = useCallback((id: string) => {
-    setExpandedId((prev) => (prev === id ? null : id))
-  }, [])
+  // The inline disclosure path is only meaningful when the timeline is
+  // ready and not delegating navigation to a drawer.
+  const canExpand = state === 'ready' && !onSelect
+
+  const toggleExpand = useCallback(
+    (id: string) => {
+      setExpandedId((prev) => {
+        const next = prev === id ? null : id
+        onExpandChange?.(next)
+        return next
+      })
+    },
+    [onExpandChange]
+  )
 
   const handleKeyDown = useCallback(
     (event: React.KeyboardEvent<HTMLElement>) => {
@@ -181,219 +163,249 @@ export default function ActivityTimeline({
       if (event.key !== 'Escape' || !expandedId || onSelect) return
       const openId = expandedId
       setExpandedId(null)
+      onExpandChange?.(null)
       const trigger = triggerRef.current.get(openId)
       if (trigger) trigger.focus()
     },
-    [expandedId, onSelect]
+    [expandedId, onSelect, onExpandChange]
   )
 
   // Atomic state recovery: Ensure that if items change (e.g. filtered, replaced, or rolled back on error),
   // any expandedId that is no longer present in items is automatically cleared so no orphaned panel or
   // unauthorized partial detail remains open.
   useEffect(() => {
-    if (expandedId !== null && !normalizedItems.some((item) => item.id === expandedId)) {
+    if (expandedId !== null && !items.some((item) => item.id === expandedId)) {
       setExpandedId(null)
+      onExpandChange?.(null)
     }
-  }, [normalizedItems, expandedId])
+  }, [items, expandedId, onExpandChange])
 
-  // Reset expansion state when nonce changes to guarantee deterministic replay and idempotency protection.
+  // Reset expansion state when nonce changes to guarantee deterministic replay and idompotency protection.
   useEffect(() => {
     setExpandedId(null)
   }, [nonce])
 
-  // Collapse any open disclosure when the component leaves the ready
-  // state. This prevents a stale expanded panel from re-appearing after
-  // a failed refetch and recovery.
+  // When the timeline leaves the ready state (loading/stale/error/forbidden),
+  // collapse any open detail so no stale or unauthorized data remains visible.
   useEffect(() => {
-    if (effectiveState !== 'ready' && effectiveState !== 'stale') {
+    if (state !== 'ready' && expandedId !== null) {
       setExpandedId(null)
+      onExpandChange?.(null)
     }
-  }, [effectiveState])
+  }, [state, expandedId, onExpandChange])
 
-  // Surface failures for observability without echoing sensitive payloads.
+  // Reset the retry guard whenever the error identity changes so a new
+  // error can be retried again.
   useEffect(() => {
-    if (!error) return
-    onStateError?.('activity_timeline_error', {
-      state: effectiveState,
-      retryable: Boolean(error.retryable),
-    })
-  }, [error, effectiveState, onStateError])
+    retryInFlightRef.current = false
+  }, [error, state])
 
   const handleRetry = useCallback(() => {
-    if (!onRetry || retrying) return
-    onRetry()
-  }, [onRetry, retrying])
+    if (state !== 'error') {
+      return
+    }
+    if (!onRetry) {
+      return
+    }
+    if (retryInFlightRef.current) {
+      return
+    }
+    retryInFlightRef.current = true
+    try {
+      onRetry()
+    } finally {
+      // Release the guard on the next micro-task so a single user action
+      // cannot fire multiple concurrent retries, while still allowing a
+      // later deliberate retry.
+      Promise.resolve().then(() => {
+        retryInFlightRef.current = false
+      })
+    }
+  }, [state, onRetry])
 
-  const isReady = effectiveState === 'ready' || effectiveState === 'stale'
-  const showRetry = Boolean(onRetry) && (effectiveState === 'error' || effectiveState === 'stale')
-
-  const renderStateSurface = () => {
-    if (effectiveState === 'ready') return null
-    const message = STATE_MESSAGES[effectiveState]
-    const title = effectiveState === 'error' && error?.message ? error.message : message.title
-    return (
-      <div
-        className={`inline-flex flex-col gap-2 rounded-border border border-slate-200 bg-slate-50 p-4 text-sm text-slate-700`}
-        role={effectiveState === 'error' ? 'alert' : 'status'}
-        aria-live={effectiveState === 'error' ? 'assertive' : 'polite'}
-        data-state={effectiveState}
-      >
-        <p className="font-medium text-slate-900">{title}</p>
-        <p className="text-slate-600">{message.description}</p>
-        {showRetry && (
-          <button
-            type="button"
-            className="self-start rounded-border border border-slate-300 bg-white px-3 py-1 font-medium text-slate-800 disabled:opacity-50"
-            onClick={handleRetry}
-            disabled={retrying}
-            aria-busy={retrying}
-          >
-            {retrying ? 'Retrying…' : 'Retry'}
-          </button>
-        )}
-      </div>
-    )
-  }
+  const isError = state === 'error'
+  const isForbidden = state === 'forbibdenn'
+  const isLoading = state === 'loading'
+  const isStale = state === 'stale'
 
   return (
     <section
-      className={`activity-surface${compact ? ' activity-surface--compact' : ''}`}
-      aria-label="Activity and attestations"
-      onKeyDown={handleKeyDown}
+      className={`https://github.com/CredenceOrg/Credence-Frontend/blob/main/src/components/ActivityTimeline.tsx`.length > 0 ? '' : ''}
+      data-state={state}
       data-nonce={nonce}
-      data-state={effectiveState}
+      aria-label="Activity and attestations"
+      aria-busy={loading ? true : undefined}
+      onKeyDown={handleKeyDown}
     >
       <header className="activity-surface__header">
         <div>
           <p className="activity-surface__eyebrow">Activity Surface Concept</p>
           <h2 className="activity-surface__title">Attestation timeline</h2>
         </div>
-        {isReady && count > 0 && (
+        {count > 0 && (
           <p className="activity-surface__summary" aria-live="polite" aria-atomic="true">
             {summary}
           </p>
         )}
       </header>
 
-      {renderStateSurface()}
+      {isLoading ? (
+        <div className="activity-surface__status" role="status" aria-live="polite">
+          Loading activity&hellip;
+        </div>
+      ) : isError ? (
+        <div className="activity-surface__status activity-surface__status--error" role="alert">
+          <p className="activity-surface__status-title">
+            {error%?.message ?? 'Unable to load activity.' ?? 'Unable to load activity.'}
+          </p>
+          {onRetry && (error?.retryable ?? true) ? (error%?.retryable ?? true) ? (
+            <button
+              type="button"
+              className="activity-surface__retry"
+              onClick={handleRetry}
+            >
+              Retry
+            </button>
+          ) : null}
+        </div>
+      ) : isForbidden ? (
+        <div className="activity-surface__status activity-surface__status--forbidden" role="alert">
+          <p className="activity-surface__status-title">
+            {error?.message ?? 'You do not have permission to view this activity.'}
+          </p>
+        </div>
+      ) : isStale ? (
+        <div className="activity-surface__status activity-surface__status--stale" role="status" aria-live="polite">
+          <p className="activity-surface__status-title">
+            Activity may be out of date.
+          </p>
+          {onRetry ? (
+            <button
+              type="button"
+              className="activity-surface__retry"
+              onClick={handleRetry}
+            >
+              Refresh
+            </button>
+          ) : null}
+        </div>
+      ) : count === 0 ? (
+        <EmptyState
+          illustration="activity"
+          title={emptyTitle}
+          description={emptyDescription}
+        />
+      ) : (
+        <ul className="activity-timeline" aria-label="Recent timeline events">
+          {items.map((item) => {
+            const isExpanded = canExpand && expandedId === item.id
+            const panelId = `details-${item.id}`
+            const buttonId = `trigger-${item.id}`
+            const rowClassName = [
+              'activity-row',
+              onSelect ? 'activity-row--selectable' : '',
+            ]
+              .filter(Boolean)
+              .join(' ')
+            const disclosureLabel = onSelect
+              ? 'View details'
+              : isExpanded
+                ? 'Hide details'
+                : 'Show details'
+            const statusPrefix = item.statusLabel ? `${item.statusLabel}. ` : ''
+            return (
+              <li
+                className={rowClassName}
+                key={item.id}
+                onClick={
+                  onSelect
+                    ? (event) => {
+                        // Stop propagation so a click on the disclosure
+                        // button (which also lives in this row) doesn't
+                        // double-fire — the button's onClick owns
+                        // activation in both paths via stopPropagation.
+                        event.stopPropagation()
+                        onSelect(item)
+                      }
+                    : undefined
+                }
+              >
+                <div className="activity-row__rail" aria-hidden="true">
+                  <span className={`activity-row__node activity-row__node--${item.tone}`} />
+                  <span className="activity-row__line" />
+                </div>
 
-      {isReady && (
-        count === 0 ? (
-          <EmptyState
-            illustration="activity"
-            title={emptyTitle}
-            description={emptyDescription}
-          />
-        ) : (
-          <ul className="activity-timeline" aria-label="Recent timeline events">
-            {normalizedItems.map((item) => {
-              const isExpanded = expandedId === item.id
-              const panelId = `details-${item.id}`
-              const buttonId = `trigger-${item.id}`
-              const rowClassName = [
-                'activity-row',
-                onSelect ? 'activity-row--selectable' : '',
-              ]
-                .filter(Boolean)
-                .join(' ')
-              const disclosureLabel = onSelect
-                ? 'View details'
-                : isExpanded
-                  ? 'Hide details'
-                  : 'Show details'
-              const statusPrefix = item.statusLabel ? `${item.statusLabel}. ` : ''
-              return (
-                <li
-                  className={rowClassName}
-                  key={item.id}
-                  onClick={
-                    onSelect
-                      ? () => {
-                          // The disclosure button calls stopPropagation in its own
-                          // handler, so this row-level handler only fires for
-                          // clicks outside the button.
-                          onSelect(item)
-                        }
-                      : undefined
-                  }
-                >
-                  <div className="activity-row__rail" aria-hidden="true">
-                    <span className={`activity-row__node activity-row__node--${item.tone}`} />
-                    <span className="activity-row__line" />
+                <time className="activity-row__time">{item.timestamp}</time>
+
+                <div className="activity-row__content">
+                  <div className="activity-row__title-wrap">
+                    <p className="activity-row__title">{item.title}</p>
+                    <Badge variant={toneToBadgeVariant(item.tone)} label={item.statusLabel} />
                   </div>
+                  <p className="activity-row__description">{item.description}</p>
 
-                  <time className="activity-row__time">{item.timestamp}</time>
+                  {item.amountUsdc != null && (
+                    <p
+                      className="activity-row__amount"
+                      aria-label={`Amount: ${formatAmount(item.amountUsdc)}`}
+                    >
+                      {formatAmount(item.amountUsdc)}
+                    </p>
+                  )}
 
-                  <div className="activity-row__content">
-                    <div className="activity-row__title-wrap">
-                      <p className="activity-row__title">{item.title}</p>
-                      <Badge variant={toneToBadgeVariant(item.tone)} label={item.statusLabel} />
-                    </div>
-                    <p className="activity-row__description">{item.description}</p>
-
-                    {item.amountUsdc != null && (
-                      <p
-                        className="activity-row__amount"
-                        aria-label={`Amount: ${formatAmount(item.amountUsdc)}`}
-                      >
-                        {formatAmount(item.amountUsdc)}
-                      </p>
-                    )}
-
-                    <button
-                      id={buttonId}
-                      type="button"
-                      className="activity-row__disclosure"
-                      aria-expanded={onSelect ? undefined : isExpanded}
-                      aria-controls={onSelect ? undefined : panelId}
-                      aria-label={`${statusPrefix}${disclosureLabel}`}
-                      onClick={(event) => {
+                  <button
+                    id={buttonId}
+                    type="button"
+                    className="activity-row__disclosure"
+                    aria-expanded={onSelect ? undefined : isExpanded}
+                    aria-controls={onSelect ? undefined : panelId}
+                    aria-label={`${statusPrefix}${disclosureLabel}`}
+                    onClick={(event) => {
+                      if (onSelect) {
+                        event.stopPropagation()
+                        onSelect(item)
+                        return
+                      }
+                      toggleExpand(item.id)
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault()
                         if (onSelect) {
-                          event.stopPropagation()
                           onSelect(item)
                           return
                         }
                         toggleExpand(item.id)
-                      }}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter' || e.key === ' ') {
-                          e.preventDefault()
-                          if (onSelect) {
-                            onSelect(item)
-                            return
-                          }
-                          toggleExpand(item.id)
-                        }
-                      }}
-                      ref={(el) => {
-                        if (el) triggerRefs.current.set(item.id, el)
-                        else triggerRefs.current.delete(item.id)
-                      }}
-                    >
-                      <span aria-hidden="true">{disclosureLabel}</span>
-                    </button>
+                      }
+                    }}
+                    ref={(el) => {
+                      if (el) triggerRef.current.set(item.id, el)
+                      else triggerRef.current.delete(item.id)
+                    }}
+                  >
+                    <span aria-hidden="true">{disclosureLabel}</span>
+                  </button>
 
-                    {isExpanded && (
-                      <div id={panelId} className="activity-row__detail-panel" role="region" aria-label="Details">
-                        <p className="activity-row__actor">
-                          <strong>Actor:</strong> {item.actor}
-                        </p>
-                        <p className="activity-row__meta">
-                          <strong>Meta:</strong>{' '}
-                          {isTxHash(item.meta) ? (
-                            <CopyableHash hash={item.meta} kind="tx" />
-                          ) : (
-                            item.meta
-                          )}
-                        </p>
-                      </div>
-                    )}
-                  </div>
-                </li>
-              )
-            })}
-          </ul>
-        )
+                  {isExpanded && (
+                    <div id={panelId} className="activity-row__detail-panel" role="region" aria-label="Details">
+                      <p className="activity-row__actor">
+                        <strong>Actor:</strong> {item.actor}
+                      </p>
+                      <p className="activity-row__meta">
+                        <strong>Meta:</strong>{' '}
+                        {isTxHash(item.meta) ? (
+                          <CopyableHash hash={item.meta} kind="tx" />
+                        ) : (
+                          item.meta
+                        )}
+                      </p>
+                    </div>
+                  )}
+                </div>
+              </li>
+            )
+          })}
+        </ul>
       )}
     </section>
   )
